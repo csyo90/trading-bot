@@ -2,9 +2,15 @@
 """Trading bot — decision engine (Linux port of run-bot.ps1). Stdlib only.
 
 Rules (idempotent, safe to run repeatedly):
-  1. PFE position exists and protective orders missing -> GTC stop-sell (-5%) + limit-sell (+8%).
+  1. PFE position exists:
+     - price at/above target (+8%) -> sell now (cancel protective order first if held).
+     - otherwise ensure ONE bracket order exists: GTC stop-sell (-5%) + take_profit_price (+8%).
+       (Alpaca holds a share against a second sell order, so stop+target must be one order.)
   2. PFE entry order open, no position, price > limit*1.02 -> cancel stale entry.
   3. No KO position, no KO order, cash >= $15 -> DAY limit buy 0.15 KO at price*1.005.
+
+A failure inside any single rule is logged and does NOT fail the run (exit 1 is
+reserved for fatal errors like bad credentials or unreachable API).
 
 Run:  python3 bot.py            (real orders)
       python3 bot.py --dry-run  (log intended actions, place nothing)
@@ -68,14 +74,16 @@ def get_price(sym):
         return float(d["quotes"][sym]["c"])
 
 
-def submit(sym, side, qty, otype, tif, limit=None, stop=None):
+def submit(sym, side, qty, otype, tif, limit=None, stop=None, take_profit=None):
     body = {"symbol": sym, "qty": str(qty), "side": side, "type": otype, "time_in_force": tif}
     if limit is not None:
         body["limit_price"] = str(limit)
     if stop is not None:
         body["stop_price"] = str(stop)
+    if take_profit is not None:
+        body["take_profit_price"] = str(take_profit)
     if DRY:
-        log(f"DRY-RUN would PLACE {side} {qty} {sym} {otype} limit={limit} stop={stop}")
+        log(f"DRY-RUN would PLACE {side} {qty} {sym} {otype} limit={limit} stop={stop} take_profit={take_profit}")
         return {"id": "dry-run"}
     return api("/orders", "POST", body)
 
@@ -109,51 +117,68 @@ def main():
         log(f"OPEN_ORDER: {o['side']} {o['symbol']} qty={o['qty']} type={o['type']} "
             f"limit={o.get('limit_price')} stop={o.get('stop_price')} id={o['id']}")
 
-    # --- Rule 1: PFE filled -> ensure protective stop + take-profit exist
+    # --- Rule 1: PFE filled -> sell at target, else ensure protective bracket exists
     pfe = next((p for p in pos if p["symbol"] == "PFE"), None)
     if pfe:
-        qty = float(pfe["qty"])
-        entry = float(pfe["avg_entry_price"])
-        stop = round(entry * 0.95, 2)
-        target = round(entry * 1.08, 2)
-        has_stop = any(o["symbol"] == "PFE" and o["side"] == "sell" and o["type"] == "stop" for o in open_orders)
-        has_target = any(o["symbol"] == "PFE" and o["side"] == "sell" and o["type"] == "limit" for o in open_orders)
-        if not has_stop:
-            o = submit("PFE", "sell", qty, "stop", "gtc", stop=stop)
-            log(f"PLACED PFE stop-sell qty={qty} stop={stop} order={o['id']}")
-            trade_csv("PFE", "sell", qty, stop, o["id"], stop, target, "protective stop (bot)")
-        if not has_target:
-            o = submit("PFE", "sell", qty, "limit", "gtc", limit=target)
-            log(f"PLACED PFE limit-sell qty={qty} target={target} order={o['id']}")
-            trade_csv("PFE", "sell", qty, target, o["id"], stop, target, "take profit (bot)")
-        if has_stop and has_target:
-            log(f"PFE already protected: stop={stop} target={target}")
+        try:
+            qty = float(pfe["qty"])
+            entry = float(pfe["avg_entry_price"])
+            stop = round(entry * 0.95, 2)
+            target = round(entry * 1.08, 2)
+            pfe_sells = [o for o in open_orders if o["symbol"] == "PFE" and o["side"] == "sell"]
+            px = get_price("PFE")
+            if px >= target:
+                # Target hit: sell now. A protective order holds the share, so
+                # cancel it first, then market-sell (DAY TIF for safety).
+                for o in pfe_sells:
+                    cancel(o["id"])
+                    log(f"CANCELED PFE protective order {o['id']} before target sell")
+                o = submit("PFE", "sell", qty, "market", "day")
+                log(f"PFE at {px} >= target {target} -> SELLING qty={qty} order={o['id']}")
+                trade_csv("PFE", "sell", qty, px, o["id"], stop, target, "take profit hit (bot)")
+            else:
+                if pfe_sells:
+                    log(f"PFE at {px} < target {target}; already protected (stop={stop})")
+                else:
+                    # ONE bracket order: Alpaca rejects a second sell order on the
+                    # same held share (40310000), so stop + take_profit go together.
+                    o = submit("PFE", "sell", qty, "stop", "gtc", stop=stop, take_profit=target)
+                    log(f"PLACED PFE bracket-sell qty={qty} stop={stop} target={target} order={o['id']}")
+                    trade_csv("PFE", "sell", qty, stop, o["id"], stop, target, "protective stop+target (bot)")
+        except Exception as e:  # noqa: BLE001
+            log(f"RULE-1 ERROR (continuing): {e}")
 
     # --- Rule 2: stale PFE entry (price ran away) -> cancel
     entry = next((o for o in open_orders
                   if o["symbol"] == "PFE" and o["side"] == "buy" and o["type"] == "limit"), None)
     if entry and not pfe:
-        px = get_price("PFE")
-        lim = float(entry["limit_price"])
-        if px > lim * 1.02:
-            cancel(entry["id"])
-            log(f"PFE at {px} > limit+2% ({lim}) -> CANCELED stale entry {entry['id']}")
-        else:
-            log(f"PFE at {px}, entry order still valid (limit {lim})")
+        try:
+            px = get_price("PFE")
+            lim = float(entry["limit_price"])
+            if px > lim * 1.02:
+                cancel(entry["id"])
+                log(f"PFE at {px} > limit+2% ({lim}) -> CANCELED stale entry {entry['id']}")
+            else:
+                log(f"PFE at {px}, entry order still valid (limit {lim})")
+        except Exception as e:  # noqa: BLE001
+            log(f"RULE-2 ERROR (continuing): {e}")
 
     # --- Rule 3: KO momentum add (fractional, DAY order, bounded)
     ko_pos = next((p for p in pos if p["symbol"] == "KO"), None)
     ko_ord = next((o for o in open_orders if o["symbol"] == "KO"), None)
     if not ko_pos and not ko_ord and cash >= 15:
-        px = get_price("KO")
-        qty = 0.15
-        limit = round(px * 1.005, 2)
-        if cash >= limit * qty:
-            o = submit("KO", "buy", qty, "limit", "day", limit=limit)
-            log(f"PLACED KO day limit buy qty={qty} @ {limit} order={o['id']}")
-            trade_csv("KO", "buy", qty, limit, o["id"], "", "", "momentum add (bot, DAY order)")
-        else:
-            log("KO skipped: insufficient cash after sizing")
+        try:
+            px = get_price("KO")
+            qty = 0.15
+            limit = round(px * 1.005, 2)
+            if cash >= limit * qty:
+                o = submit("KO", "buy", qty, "limit", "day", limit=limit)
+                log(f"PLACED KO day limit buy qty={qty} @ {limit} order={o['id']}")
+                trade_csv("KO", "buy", qty, limit, o["id"], "", "", "momentum add (bot, DAY order)")
+            else:
+                log("KO skipped: insufficient cash after sizing")
+        except Exception as e:  # noqa: BLE001
+            log(f"RULE-3 ERROR (continuing): {e}")
 
     log("=== Bot run complete ===")
 
