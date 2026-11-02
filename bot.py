@@ -2,10 +2,12 @@
 """Trading bot — decision engine (Linux port of run-bot.ps1). Stdlib only.
 
 Rules (idempotent, safe to run repeatedly):
-  1. PFE position exists:
+  1. EVERY held position:
      - price at/above target (+8%) -> sell now (cancel protective order first if held).
-     - otherwise ensure ONE bracket order exists: GTC stop-sell (-5%) + take_profit_price (+8%).
+     - otherwise ensure ONE bracket order exists: stop-sell (-5%) + take_profit_price (+8%).
        (Alpaca holds a share against a second sell order, so stop+target must be one order.)
+     - Whole shares: GTC. Fractional shares: DAY (Alpaca: no fractional GTC stops);
+       a DAY bracket dies at close, and the next bot run re-places it.
   2. PFE entry order open, no position, price > limit*1.02 -> cancel stale entry.
   3. No KO position, no KO order, cash >= $15 -> DAY limit buy 0.15 KO at price*1.005.
 
@@ -117,36 +119,42 @@ def main():
         log(f"OPEN_ORDER: {o['side']} {o['symbol']} qty={o['qty']} type={o['type']} "
             f"limit={o.get('limit_price')} stop={o.get('stop_price')} id={o['id']}")
 
-    # --- Rule 1: PFE filled -> sell at target, else ensure protective bracket exists
-    pfe = next((p for p in pos if p["symbol"] == "PFE"), None)
-    if pfe:
+    # --- Rule 1: every held position -> sell at target, else ensure protective bracket
+    for p in pos:
+        sym = p["symbol"]
         try:
-            qty = float(pfe["qty"])
-            entry = float(pfe["avg_entry_price"])
+            qty = float(p["qty"])
+            entry = float(p["avg_entry_price"])
             stop = round(entry * 0.95, 2)
             target = round(entry * 1.08, 2)
-            pfe_sells = [o for o in open_orders if o["symbol"] == "PFE" and o["side"] == "sell"]
-            px = get_price("PFE")
+            fractional = qty != int(qty)
+            # Fractional stops must be DAY on Alpaca (no fractional GTC stops);
+            # whole shares can be GTC. DAY brackets die at close; next run re-places.
+            tif = "day" if fractional else "gtc"
+            sells = [o for o in open_orders if o["symbol"] == sym and o["side"] == "sell"]
+            px = get_price(sym)
             if px >= target:
                 # Target hit: sell now. A protective order holds the share, so
-                # cancel it first, then market-sell (DAY TIF for safety).
-                for o in pfe_sells:
+                # cancel it first, then market-sell.
+                for o in sells:
                     cancel(o["id"])
-                    log(f"CANCELED PFE protective order {o['id']} before target sell")
-                o = submit("PFE", "sell", qty, "market", "day")
-                log(f"PFE at {px} >= target {target} -> SELLING qty={qty} order={o['id']}")
-                trade_csv("PFE", "sell", qty, px, o["id"], stop, target, "take profit hit (bot)")
+                    log(f"CANCELED {sym} protective order {o['id']} before target sell")
+                o = submit(sym, "sell", qty, "market", tif)
+                log(f"{sym} at {px} >= target {target} -> SELLING qty={qty} order={o['id']}")
+                trade_csv(sym, "sell", qty, px, o["id"], stop, target, "take profit hit (bot)")
             else:
-                if pfe_sells:
-                    log(f"PFE at {px} < target {target}; already protected (stop={stop})")
+                if sells:
+                    log(f"{sym} at {px} < target {target}; already protected (stop={stop}, tif={sells[0].get('time_in_force')})")
                 else:
                     # ONE bracket order: Alpaca rejects a second sell order on the
                     # same held share (40310000), so stop + take_profit go together.
-                    o = submit("PFE", "sell", qty, "stop", "gtc", stop=stop, take_profit=target)
-                    log(f"PLACED PFE bracket-sell qty={qty} stop={stop} target={target} order={o['id']}")
-                    trade_csv("PFE", "sell", qty, stop, o["id"], stop, target, "protective stop+target (bot)")
+                    o = submit(sym, "sell", qty, "stop", tif, stop=stop, take_profit=target)
+                    log(f"PLACED {sym} bracket-sell qty={qty} stop={stop} target={target} tif={tif} order={o['id']}")
+                    trade_csv(sym, "sell", qty, stop, o["id"], stop, target, "protective stop+target (bot)")
         except Exception as e:  # noqa: BLE001
-            log(f"RULE-1 ERROR (continuing): {e}")
+            log(f"RULE-1 ERROR for {sym} (continuing): {e}")
+
+    pfe = next((p for p in pos if p["symbol"] == "PFE"), None)
 
     # --- Rule 2: stale PFE entry (price ran away) -> cancel
     entry = next((o for o in open_orders
